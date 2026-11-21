@@ -6,3 +6,7 @@ work/
 .playwright-mcp/
 *.ndjson
 *.manifest.json
+
+# 验证材料留在本地
+/test/
+/tests/

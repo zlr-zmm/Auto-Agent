@@ -1,0 +1,175 @@
+{
+  "sources": {
+    "feishu-intake": {
+      "name": "飞书需求"
+    },
+    "github-workflow": {
+      "name": "GitHub 工单"
+    },
+    "github-delivery": {
+      "name": "GitHub 交付"
+    }
+  },
+  "agents": {
+    "feishu-poll": {
+      "name": "飞书轮询",
+      "worker": "auto-agent-worker",
+      "use": "command",
+      "command": [
+        "node",
+        "superagent.mjs",
+        "poll",
+        "--autoloop"
+      ]
+    },
+    "issue-poll": {
+      "name": "GitHub Issue 轮询",
+      "worker": "auto-agent-worker",
+      "use": "command",
+      "command": [
+        "node",
+        "vendor/agent-autoloop/examples/recipes/github-issues/watch.ts",
+        "zlr-zmm/Auto-Agent",
+        "label:auto-agent-ready -label:auto-agent-working -label:auto-agent-waiting sort:created-asc"
+      ]
+    },
+    "followups": {
+      "name": "工单复查",
+      "worker": "auto-agent-worker",
+      "use": "command",
+      "command": [
+        "node",
+        "recipes/feishu-github/followups.mjs"
+      ]
+    },
+    "codex": {
+      "name": "Codex",
+      "worker": "auto-agent-worker",
+      "use": "codex",
+      "access": "edit"
+    },
+    "delivery-poll": {
+      "name": "交付标签轮询",
+      "worker": "auto-agent-delivery",
+      "use": "command",
+      "command": [
+        "node",
+        "vendor/agent-autoloop/plugins/delivery/poll.ts",
+        "zlr-zmm/Auto-Agent"
+      ]
+    },
+    "delivery": {
+      "name": "PR 交付",
+      "worker": "auto-agent-delivery",
+      "use": "delivery",
+      "command": [
+        "zlr-zmm/Auto-Agent"
+      ],
+      "timeout": 35
+    }
+  },
+  "rules": [
+    {
+      "name": "读取飞书需求",
+      "when": {
+        "cron": "*/2 * * * *"
+      },
+      "to": "feishu-poll",
+      "cwd": "C:/path/to/Auto-Agent",
+      "prompt": "使用来源密钥提交飞书事件，确认接收后推进游标。",
+      "tell": "never"
+    },
+    {
+      "name": "整理飞书需求",
+      "when": {
+        "source": "feishu-intake",
+        "types": [
+          "feishu.message"
+        ]
+      },
+      "to": "codex",
+      "cwd": "C:/path/to/Auto-Agent",
+      "skill": "feishu-intake",
+      "parallel": 1,
+      "resume": true
+    },
+    {
+      "name": "读取已确认 Issue",
+      "when": {
+        "cron": "*/2 * * * *"
+      },
+      "to": "issue-poll",
+      "cwd": "C:/path/to/Auto-Agent",
+      "tell": "never",
+      "emits": {
+        "source": "github-workflow",
+        "types": [
+          "issues.opened"
+        ]
+      }
+    },
+    {
+      "name": "复查依赖和 PR 状态",
+      "when": {
+        "cron": "*/3 * * * *"
+      },
+      "to": "followups",
+      "cwd": "C:/path/to/Auto-Agent",
+      "tell": "never",
+      "emits": {
+        "source": "github-workflow",
+        "types": [
+          "issue.ready",
+          "issue.revise"
+        ]
+      }
+    },
+    {
+      "name": "开发 GitHub Issue",
+      "when": {
+        "source": "github-workflow",
+        "types": [
+          "issues.opened",
+          "issue.ready",
+          "issue.revise"
+        ]
+      },
+      "to": "codex",
+      "cwd": "C:/path/to/Auto-Agent",
+      "skill": "deliver-issue",
+      "parallel": 2,
+      "resume": true,
+      "title": "issue-{id}"
+    },
+    {
+      "name": "读取交付标签",
+      "when": {
+        "cron": "*/2 * * * *"
+      },
+      "to": "delivery-poll",
+      "cwd": "C:/path/to/Auto-Agent",
+      "tell": "never",
+      "emits": {
+        "source": "github-delivery",
+        "types": [
+          "pull_request.labeled",
+          "issues.labeled"
+        ]
+      }
+    },
+    {
+      "name": "核验并交付 PR",
+      "when": {
+        "source": "github-delivery",
+        "types": [
+          "pull_request.labeled",
+          "issues.labeled"
+        ]
+      },
+      "to": "delivery",
+      "cwd": "C:/path/to/Auto-Agent",
+      "parallel": 1,
+      "prompt": "使用目标仓库 main 的交付配置。"
+    }
+  ]
+}

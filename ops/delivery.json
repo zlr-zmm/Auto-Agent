@@ -1,0 +1,25 @@
+{
+  "repo": "zlr-zmm/Auto-Agent",
+  "internal": [],
+  "check": {
+    "workflow": "check.yml",
+    "job": "check"
+  },
+  "review": {
+    "points": "AGENTS.md",
+    "status": "agent-review",
+    "xhigh": [
+      "AGENTS.md",
+      "SKILL.md",
+      "superagent.mjs",
+      "feishu-watch.ts",
+      "config.example.json",
+      ".gitmodules",
+      ".github/**/*",
+      "ops/**/*",
+      "recipes/**/*",
+      "rules.workflow.example.json",
+      "vendor/agent-autoloop"
+    ]
+  }
+}
