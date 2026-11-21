@@ -1,0 +1,3 @@
+[submodule "agent-autoloop"]
+	path = vendor/agent-autoloop
+	url = https://github.com/KKKKhazix/agent-autoloop.git

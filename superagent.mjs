@@ -4,7 +4,7 @@
  * 设计原则（复刻 superagent 指南）：授权是代码不是提示词；先存储后动作；宿主拥有通信。
  *
  * 命令：
- *   poll                                     拉取新消息 → 确定性门禁 → 打印准入触发器 JSON（并推进游标）
+ *   poll [--autoloop]                        拉取新消息，应用门禁并输出；可提交到 Agent Autoloop
  *   send --text "..." [--reply-to om_x]      机器人发消息/回复（markdown）
  *   issues create --json '{"records":[…]}'   批量建行（epic/task 字段映射见 SKILL）
  *   issues update --record recX --json '{…}' 更新行（状态流转/PR 回写）
@@ -17,8 +17,9 @@
  *   3. @机器人，或 回复对象是机器人的消息（会话延续）→ 准入
  *   4. 其他 → 忽略 not_addressed
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
@@ -208,7 +209,15 @@ function prsCheck() {
 const loadState = () => existsSync(STATE_PATH)
   ? JSON.parse(readFileSync(STATE_PATH, 'utf8'))
   : { cursorPosition: 0, seen: [], botMessageIds: [], threads: {}, ignored: 0 }
-const saveState = state => writeFileSync(STATE_PATH, JSON.stringify(state, null, 2) + '\n')
+function saveState(state) {
+  const tmp = `${STATE_PATH}.${randomUUID()}.tmp`
+  try {
+    writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+    renameSync(tmp, STATE_PATH)
+  } finally {
+    rmSync(tmp, { force: true })
+  }
+}
 
 /** 运行 lark-cli；剥离进度行，从第一个 '{' 起解析 JSON；失败抛出可读错误。 */
 function lark(args) {
@@ -217,8 +226,8 @@ function lark(args) {
     encoding: 'utf8',
     maxBuffer: 32 * 1024 * 1024,
   })
-  const text = `${res.stdout ?? ''}${res.stderr ?? ''}`
-  if (res.status !== 0) throw new Error(`lark-cli 退出码 ${res.status}: ${text.slice(0, 500)}`)
+  const text = res.stdout ?? ''
+  if (res.status !== 0) throw new Error(`lark-cli 退出码 ${res.status}: ${(res.stderr || text || res.error?.message || '').slice(0, 500)}`)
   const start = text.indexOf('{')
   if (start < 0) return { raw: text }
   const parsed = JSON.parse(text.slice(start))
@@ -229,6 +238,21 @@ function lark(args) {
 const arg = (name, fallback) => {
   const i = process.argv.indexOf(name)
   return i > 0 ? process.argv[i + 1] : fallback
+}
+
+function admit(state, m, knownTopic = false) {
+  if (m.deleted) return
+  const senderId = m.sender?.id ?? ''
+  if (senderId === CONFIG.botOpenId || m.sender?.sender_type !== 'user') return
+  if (!CONFIG.allowedOpenIds.includes(senderId)) { state.ignored++; return }
+  const mentionsBot = (m.mentions ?? []).some(x => x.id === CONFIG.botOpenId)
+  const repliesBot = state.botMessageIds.includes(m.parent_id)
+  if (!mentionsBot && !repliesBot && !knownTopic) { state.ignored++; return }
+  return {
+    message_id: m.message_id, position: m.message_position, at: m.create_time,
+    from: { id: senderId, name: m.sender.name }, text: m.content,
+    mentionsBot, repliesBot, url: m.message_app_link, parent_id: m.parent_id ?? null,
+  }
 }
 
 /** 拉取新消息并应用门禁。首次运行（无状态文件）只建立游标，不重放历史。 */
@@ -252,21 +276,131 @@ function poll() {
     state.seen.push(m.message_id)
     if (state.seen.length > SEEN_LIMIT) state.seen.splice(0, state.seen.length - SEEN_LIMIT)
     state.cursorPosition = Math.max(state.cursorPosition, Number(m.message_position))
-    if (m.deleted) continue
-    const senderId = m.sender?.id ?? ''
-    if (senderId === CONFIG.botOpenId || m.sender?.sender_type !== 'user') continue // 规则1：自身/机器人
-    if (!CONFIG.allowedOpenIds.includes(senderId)) { state.ignored++; continue }    // 规则2：名单
-    const mentionsBot = (m.mentions ?? []).some(x => x.id === CONFIG.botOpenId)
-    const repliesBot = m.parent_id != null && state.botMessageIds.includes(m.parent_id) // 规则3：会话延续
-    if (!mentionsBot && !repliesBot) { state.ignored++; continue }                  // 规则4
-    admitted.push({
-      message_id: m.message_id, position: m.message_position, at: m.create_time,
-      from: { id: senderId, name: m.sender.name }, text: m.content,
-      mentionsBot, repliesBot, url: m.message_app_link, parent_id: m.parent_id ?? null,
-    })
+    const message = admit(state, m)
+    if (message) admitted.push(message)
   }
   saveState(state)
   console.log(JSON.stringify({ admitted, cursorPosition: state.cursorPosition, ignoredTotal: state.ignored }, null, 2))
+}
+
+const validMessageId = value => typeof value === 'string' && /^om_[A-Za-z0-9_-]{1,90}$/.test(value)
+const messageTime = message => /^\d{13}$/.test(message.create_time) ? Number(message.create_time) : Date.parse(message.create_time)
+
+function messagePages(args, stop) {
+  const messages = []
+  const tokens = new Set()
+  let token
+  do {
+    const { data } = lark([...args, '--order', 'desc', '--no-reactions', ...(token ? ['--page-token', token] : [])])
+    if (!Array.isArray(data?.messages)) throw new Error('飞书返回的消息列表无效')
+    messages.push(...data.messages)
+    if (stop(data.messages) || !data.has_more) break
+    token = data.page_token
+    if (!token || tokens.has(token)) throw new Error('飞书分页未返回新的游标')
+    tokens.add(token)
+  } while (token)
+  return messages
+}
+
+function threadReplies(chatMessages, roots, baseline, previous) {
+  const hosts = new Map(chatMessages.filter(m => validMessageId(m.message_id)).map(m => [m.message_id, m]))
+  const missing = [...roots].filter(id => !hosts.has(id))
+  for (let i = 0; i < missing.length; i += 50) {
+    const { data } = lark(['im', '+messages-mget', '--message-ids', missing.slice(i, i + 50).join(','), '--no-reactions'])
+    if (!Array.isArray(data?.messages)) throw new Error('飞书返回的话题消息无效')
+    for (const host of data.messages) if (roots.has(host.message_id)) hosts.set(host.message_id, host)
+  }
+  const replies = []
+  const read = new Set()
+  for (const host of hosts.values()) {
+    const threadId = /^(?:omt|om)_[A-Za-z0-9_-]+$/.test(host.thread_id ?? '')
+      ? host.thread_id : (host.thread_has_more || host.thread_replies_error ? host.message_id : null)
+    if (!threadId || read.has(threadId)) continue
+    read.add(threadId)
+    const root = validMessageId(host.root_id) ? host.root_id : host.message_id
+    const after = Math.max(baseline, (previous[root] ?? baseline) - 15 * 60_000)
+    const thread = host.thread_has_more || host.thread_replies_error || !Array.isArray(host.thread_replies)
+      ? messagePages(['im', '+threads-messages-list', '--thread', threadId], items => items.some(m => messageTime(m) < after))
+      : host.thread_replies ?? []
+    for (const m of thread) {
+      if (m.message_id === root) continue
+      const time = messageTime(m)
+      if (time >= after) {
+        replies.push({ ...m, root_id: root })
+        watermarks[root] = Math.max(watermarks[root] ?? baseline, time)
+      }
+    }
+  }
+  return { replies, watermarks }
+}
+
+function eventFor(message, root) {
+  const topic = `feishu:${root}`
+  const source = { ...message, topic, root_id: root, text: '' }
+  const text = typeof message.text === 'string' ? message.text : JSON.stringify(message.text ?? '')
+  let link
+  try {
+    const url = new URL(message.url)
+    if (['https:', 'http:'].includes(url.protocol) && !url.username && !url.password && url.href.length <= 500) link = url.href
+  } catch { /* The link is optional. */ }
+  source.url = link
+  let remaining = 4000 - [...JSON.stringify(source)].length
+  for (const ch of text) {
+    remaining -= [...JSON.stringify(ch)].length - 2
+    if (remaining < 0) break
+    source.text += ch
+  }
+  return { id: message.message_id, type: 'feishu.message', subject: topic, summary: [...text].slice(0, 200).join(''), detail: JSON.stringify(source), link }
+}
+
+async function pollAutoloop() {
+  const { hubUrl, feishuSourceKey } = CONFIG.workflow ?? {}
+  if (!hubUrl || !feishuSourceKey) throw new Error('config.json 需要 workflow.hubUrl 和 workflow.feishuSourceKey')
+  const endpoint = new URL('/v1/events', hubUrl)
+  const firstRun = !existsSync(STATE_PATH)
+  const started = Date.now()
+  const state = loadState()
+  const baseline = state.autoloopStartedAt ?? started
+  let watermarks = state.autoloopThreads ?? {}
+  const topics = state.autoloopTopics ?? {}
+  const roots = new Set(Object.values(topics))
+  const chat = messagePages(['im', '+chat-messages-list', '--chat-id', CONFIG.chatId], items => firstRun || items.some(m => Number(m.message_position) <= state.cursorPosition))
+  if (chat.some(m => m.message_position == null || !Number.isSafeInteger(Number(m.message_position)))) throw new Error('飞书返回的消息缺少有效位置')
+  const cursorPosition = chat.reduce((max, m) => Math.max(max, Number(m.message_position)), state.cursorPosition)
+  const seen = new Set(state.seen)
+  const published = []
+  if (firstRun) chat.forEach(m => seen.add(m.message_id))
+  else {
+    const threaded = threadReplies(chat, roots, baseline, watermarks)
+    watermarks = threaded.watermarks
+    const fresh = [...chat.filter(m => Number(m.message_position) > state.cursorPosition), ...threaded.replies]
+      .sort((a, b) => (messageTime(a) - messageTime(b)) || (Number(a.message_position) - Number(b.message_position)))
+    for (const m of fresh) {
+      const id = m.message_id
+      if (!validMessageId(id) || seen.has(id)) continue
+      seen.add(id)
+      const parent = validMessageId(m.parent_id) && m.parent_id !== id ? m.parent_id : undefined
+      const root = validMessageId(m.root_id) && m.root_id !== id ? m.root_id : undefined
+      const known = topics[id] ?? topics[parent] ?? topics[root] ?? (roots.has(root) ? root : undefined)
+      const message = admit(state, m, Boolean(known))
+      if (!message) continue
+      const subjectRoot = known ?? root ?? parent ?? id
+      const event = eventFor(message, subjectRoot)
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { Authorization: `Bearer ${feishuSourceKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(event), redirect: 'error', signal: AbortSignal.timeout(15000),
+      })
+      const result = await response.json().catch(() => null)
+      if (!response.ok || !Number.isSafeInteger(result?.event) || typeof result.duplicate !== 'boolean') throw new Error(`Agent Autoloop 未接收消息 ${id}（HTTP ${response.status}）`)
+      roots.add(subjectRoot)
+      topics[id] = subjectRoot
+      published.push({ id, topic: event.subject, event: result.event, duplicate: result.duplicate })
+    }
+  }
+  const latest = loadState()
+  saveState({ ...latest, cursorPosition, ignored: state.ignored, seen: [...seen].slice(-SEEN_LIMIT),
+    autoloopStartedAt: baseline, autoloopThreads: watermarks, autoloopTopics: { ...topics, ...latest.autoloopTopics } })
+  console.log(JSON.stringify({ initialized: firstRun, published, cursorPosition, ignoredTotal: state.ignored }))
 }
 
 function send() {
@@ -276,10 +410,22 @@ function send() {
   const args = replyTo
     ? ['im', '+messages-reply', '--message-id', replyTo, '--markdown', text]
     : ['im', '+messages-send', '--chat-id', CONFIG.chatId, '--markdown', text]
+  const key = arg('--idempotency-key')
+  if (process.argv.includes('--idempotency-key')) {
+    if (!key || [...key].length > 50) throw new Error('--idempotency-key 需要 1 到 50 个字符')
+    args.push('--idempotency-key', key)
+  }
   const out = lark(args)
   const id = out.data?.message_id
+  if (key && !validMessageId(id)) throw new Error('飞书未返回已发送的消息 ID')
   const state = loadState()
-  if (id) { state.botMessageIds.push(id); if (state.botMessageIds.length > 200) state.botMessageIds.splice(0, state.botMessageIds.length - 200) }
+  if (id) {
+    state.botMessageIds.push(id)
+    if (state.botMessageIds.length > 200) state.botMessageIds.splice(0, state.botMessageIds.length - 200)
+    if (validMessageId(id) && validMessageId(replyTo) && state.autoloopTopics?.[replyTo]) {
+      state.autoloopTopics[id] = state.autoloopTopics[replyTo]
+    }
+  }
   saveState(state)
   console.log(JSON.stringify({ sent: true, message_id: id }))
 }
@@ -325,7 +471,7 @@ function state() {
 
 const cmd = process.argv[2]
 try {
-  if (cmd === 'poll') poll()
+  if (cmd === 'poll') process.argv.includes('--autoloop') ? await pollAutoloop() : poll()
   else if (cmd === 'send') send()
   else if (cmd === 'issues') { const sub = process.argv[3]; if (sub === 'create') issuesCreate(); else if (sub === 'update') issuesUpdate(); else if (sub === 'list') issuesList(); else throw new Error(`未知子命令 ${sub}`) }
   else if (cmd === 'state') state()
