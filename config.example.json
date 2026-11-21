@@ -1,0 +1,13 @@
+{
+  "chatId": "oc_xxx（接收 @机器人 消息的群）",
+  "botOpenId": "ou_xxx（机器人 open_id，用于 @ 检测与防循环）",
+  "botName": "机器人名",
+  "allowedOpenIds": ["ou_xxx（能发起需求的用户）"],
+  "baseToken": "多维表格 app_token",
+  "tableId": "tblxxx（工单表）",
+  "larkCli": "lark-cli",
+  "configDir": "lark-cli 机器人专用配置目录（strict-mode bot）",
+  "baseUrl": "多维表格链接",
+  "repoPath": "工作目标仓库本地路径（worktree 从这里切）",
+  "githubRepo": "OWNER/REPO（PR 开到这里）"
+}
